@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: box -f FILE [-- COMMAND [ARG...]]
+
+Create an ephemeral workspace sandbox from a YAML mapping:
+
+  chadlands: /home/ogle/src/chadlands
+
+Each mapping value must be an existing regular file or directory. It is mounted
+read-write at /workspace/NAME. Without COMMAND, box starts an interactive shell.
+EOF
+}
+
+die() {
+  printf 'box: %s\n' "$*" >&2
+  exit 1
+}
+
+config=''
+while (($#)); do
+  case "$1" in
+    -f|--file)
+      (($# >= 2)) || die "missing value for $1"
+      config="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      die "expected -f FILE or -- before the command"
+      ;;
+  esac
+done
+
+[[ -n "$config" ]] || die "-f FILE is required"
+[[ -r "$config" ]] || die "cannot read configuration: $config"
+
+# Keep the accepted format intentionally small: a non-empty mapping. Each
+# resulting path is checked below before it can become a Bubblewrap argument.
+yq -e 'type == "!!map" and length > 0' "$config" >/dev/null \
+  || die "configuration must be a non-empty mapping of names to paths"
+
+mapfile -t entries < <(yq -r 'to_entries[] | [.key, .value] | @tsv' "$config")
+
+declare -a bwrap_args=(--tmpfs /)
+
+# Reconstruct the host root read-only in a private tmpfs root. A whole-root
+# read-only bind cannot create the /workspace mountpoint without touching host
+# state, while this permits the one dedicated writable workspace mount below.
+shopt -s dotglob nullglob
+for root_path in /*; do
+  case "$root_path" in
+    /dev|/proc|/run|/tmp|/workspace)
+      ;;
+    *)
+      bwrap_args+=(--ro-bind "$root_path" "$root_path")
+      ;;
+  esac
+done
+
+bwrap_args+=(
+  --dir /dev
+  --dir /proc
+  --dir /tmp
+  --dir /run
+  --tmpfs /workspace
+  --remount-ro /
+  --dev /dev
+  --dev-bind /dev/pts /dev/pts
+  --proc /proc
+  --tmpfs /tmp
+  --tmpfs /run
+  --setenv XDG_CACHE_HOME /tmp/xdg-cache
+  --setenv XDG_DATA_HOME /tmp/xdg-data
+  --setenv XDG_STATE_HOME /tmp/xdg-state
+  --setenv XDG_RUNTIME_DIR /tmp/xdg-runtime
+)
+
+# NixOS exposes system tools and privileged wrappers under /run. Preserve those
+# profiles without exposing the host's user runtime sockets or other /run state.
+for runtime_path in /run/current-system /run/wrappers; do
+  [[ -e "$runtime_path" ]] && bwrap_args+=(--ro-bind "$runtime_path" "$runtime_path")
+done
+
+bwrap_args+=(
+  --bind /nix/store /nix/store
+  --chdir /workspace
+  --die-with-parent
+)
+
+# A regular-file mount needs an existing destination before Bubblewrap can bind it.
+exec {empty_fd}</dev/null
+
+for entry in "${entries[@]}"; do
+  IFS=$'\t' read -r name source <<<"$entry"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+    || die "invalid workspace name: $name"
+  [[ -n "$source" ]] || die "empty path for workspace: $name"
+
+  source="$(realpath -e -- "$source")" \
+    || die "path does not exist for $name: $source"
+
+  destination="/workspace/$name"
+  if [[ -d "$source" ]]; then
+    bwrap_args+=(--dir "$destination")
+  elif [[ -f "$source" ]]; then
+    bwrap_args+=(--file "$empty_fd" "$destination")
+  else
+    die "path for $name is not a regular file or directory: $source"
+  fi
+  bwrap_args+=(--bind "$source" "$destination")
+done
+
+if (($# == 0)); then
+  command=("${SHELL:-/bin/sh}" -i)
+else
+  command=("$@")
+fi
+
+exec bwrap "${bwrap_args[@]}" -- "${command[@]}"
