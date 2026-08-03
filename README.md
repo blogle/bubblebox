@@ -17,6 +17,34 @@ box -f ./bubblebox.yml -- opencode
 Without a command after `--`, `box` opens an interactive shell in
 `/workspace`. Arbitrary commands and arguments are passed unchanged.
 
+### Home Manager
+
+Add Bubblebox as an input to your dotfiles flake and apply its overlay:
+
+```nix
+{
+  inputs.bubblebox.url = "github:blogle/bubblebox";
+
+  outputs = { nixpkgs, home-manager, bubblebox, ... }: {
+    homeConfigurations.your-user = home-manager.lib.homeManagerConfiguration {
+      pkgs = import nixpkgs {
+        system = "x86_64-linux";
+        overlays = [ bubblebox.overlays.default ];
+      };
+      modules = [
+        {
+          home.packages = [ bubblebox.packages.x86_64-linux.box ];
+        }
+      ];
+    };
+  };
+}
+```
+
+Once the overlay is applied, `pkgs.box` is also available, so a module can use
+`home.packages = [ pkgs.box ];` instead. Replace `x86_64-linux` with
+`aarch64-linux` when appropriate.
+
 ## Configuration
 
 Configuration is structured YAML. `workspace` is required and must be a
