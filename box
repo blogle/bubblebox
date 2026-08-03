@@ -5,9 +5,12 @@ usage() {
   cat <<'EOF'
 Usage: box -f FILE [-- COMMAND [ARG...]]
 
-Create an ephemeral workspace sandbox from a YAML mapping:
+Create an ephemeral workspace sandbox from a YAML configuration:
 
-  chadlands: /home/ogle/src/chadlands
+  workspace:
+    chadlands: /home/ogle/src/chadlands
+  access:
+    opencode: true
 
 Each mapping value must be an existing regular file or directory. It is mounted
 read-write at /workspace/NAME. Without COMMAND, box starts an interactive shell.
@@ -44,20 +47,86 @@ done
 [[ -n "$config" ]] || die "-f FILE is required"
 [[ -r "$config" ]] || die "cannot read configuration: $config"
 
-# Keep the accepted format intentionally small: a non-empty mapping. Each
-# resulting path is checked below before it can become a Bubblewrap argument.
-yq -e 'type == "!!map" and length > 0' "$config" >/dev/null \
-  || die "configuration must be a non-empty mapping of names to paths"
+host_home="${HOME:?HOME is not set}"
+[[ "$host_home" == /* && -d "$host_home" ]] || die "HOME must name an existing absolute directory"
+host_home="$(realpath -e -- "$host_home")"
+host_home_relative="${host_home#/}"
+host_home_root="/${host_home_relative%%/*}"
+[[ "$host_home_root" != / ]] || die "HOME cannot be the filesystem root"
 
-mapfile -t entries < <(yq -r 'to_entries[] | [.key, .value] | @tsv' "$config")
+# Validate the structure before extracting any values. Values are fetched one
+# at a time rather than encoded as TSV: tabs, spaces, and quotes in paths are
+# consequently not given a second, lossy parsing step.
+yq -e 'type == "!!map"' "$config" >/dev/null \
+  || die "configuration must be a mapping"
+mapfile -t top_keys < <(yq -r 'keys[]' "$config")
+for key in "${top_keys[@]}"; do
+  case "$key" in
+    workspace|access) ;;
+    *) die "unknown configuration key: $key" ;;
+  esac
+done
+yq -e 'has("workspace") and (.workspace | type == "!!map" and length > 0)' "$config" >/dev/null \
+  || die "workspace must be a non-empty mapping"
+if yq -e 'has("access")' "$config" >/dev/null 2>&1; then
+  yq -e '.access | type == "!!map"' "$config" >/dev/null \
+    || die "access must be a mapping"
+  mapfile -t access_keys < <(yq -r '.access | keys[]' "$config")
+  for key in "${access_keys[@]}"; do
+    case "$key" in
+      ssh|opencode) ;;
+      *) die "unknown access key: $key" ;;
+    esac
+    KEY="$key" yq -e '.access[strenv(KEY)] | type == "!!bool"' "$config" >/dev/null \
+      || die "access.$key must be a boolean"
+  done
+fi
 
-declare -a bwrap_args=(--tmpfs /)
+mapfile -t workspace_names < <(yq -r '.workspace | keys[]' "$config")
+declare -a workspace_sources workspace_types
+for name in "${workspace_names[@]}"; do
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+    || die "invalid workspace name: $name"
+  case "$name" in
+    AGENTS.md|.gitconfig|.nix-profile|.config|.cache|.local) \
+      die "workspace name is reserved: $name" ;;
+  esac
+  source="$(NAME="$name" yq -r '.workspace[strenv(NAME)]' "$config")"
+  NAME="$name" yq -e '.workspace[strenv(NAME)] | type == "!!str" and length > 0' "$config" >/dev/null \
+    || die "workspace value must be a nonempty scalar string: $name"
+  source="$(realpath -e -- "$source")" \
+    || die "path does not exist for $name: $source"
+  if [[ -d "$source" ]]; then
+    workspace_types+=(directory)
+  elif [[ -f "$source" ]]; then
+    workspace_types+=(file)
+  else
+    die "path for $name is not a regular file or directory: $source"
+  fi
+  workspace_sources+=("$source")
+done
+
+access_ssh=false
+access_opencode=true
+if yq -e 'has("access")' "$config" >/dev/null 2>&1; then
+  if yq -e '.access | has("ssh")' "$config" >/dev/null 2>&1; then
+    access_ssh="$(yq -r '.access.ssh' "$config")"
+  fi
+  if yq -e '.access | has("opencode")' "$config" >/dev/null 2>&1; then
+    access_opencode="$(yq -r '.access.opencode' "$config")"
+  fi
+fi
+
+declare -a bwrap_args=(--unshare-all --share-net --tmpfs /)
 
 # Reconstruct the host root read-only in a private tmpfs root. A whole-root
 # read-only bind cannot create the /workspace mountpoint without touching host
 # state, while this permits the one dedicated writable workspace mount below.
 shopt -s dotglob nullglob
 for root_path in /*; do
+  # The real home is hidden, not merely made read-only. Selected files and
+  # application state are mounted into the synthetic home below.
+  [[ "$root_path" == "$host_home_root" || "$root_path" == /root ]] && continue
   case "$root_path" in
     /dev|/proc|/run|/tmp|/workspace)
       ;;
@@ -67,6 +136,9 @@ for root_path in /*; do
   esac
 done
 
+uid="$(id -u)"
+runtime_dir="/run/user/$uid"
+
 bwrap_args+=(
   --dir /dev
   --dir /proc
@@ -75,15 +147,33 @@ bwrap_args+=(
   --tmpfs /workspace
   --remount-ro /
   --dev /dev
-  --dev-bind /dev/pts /dev/pts
   --proc /proc
   --tmpfs /tmp
   --tmpfs /run
-  --setenv XDG_CACHE_HOME /tmp/xdg-cache
-  --setenv XDG_DATA_HOME /tmp/xdg-data
-  --setenv XDG_STATE_HOME /tmp/xdg-state
-  --setenv XDG_RUNTIME_DIR /tmp/xdg-runtime
+  --dir "$runtime_dir"
+  --chmod 0700 "$runtime_dir"
+  --setenv HOME /workspace
+  --setenv XDG_CONFIG_HOME /workspace/.config
+  --setenv XDG_CACHE_HOME /workspace/.cache
+  --setenv XDG_DATA_HOME /workspace/.local/share
+  --setenv XDG_STATE_HOME /workspace/.local/state
+  --setenv XDG_RUNTIME_DIR "$runtime_dir"
 )
+
+# On systemd-resolved hosts, /etc/resolv.conf commonly points into /run. Copy
+# that dynamic file to the same target inside the private /run so libc DNS,
+# search domains, and services such as Tailscale MagicDNS keep working without
+# exposing the rest of the host runtime directory.
+if [[ -r /etc/resolv.conf ]]; then
+  resolver_target="$(realpath -e -- /etc/resolv.conf)"
+  case "$resolver_target" in
+    /run/*)
+      exec {resolver_fd}</etc/resolv.conf
+      bwrap_args+=(--dir "${resolver_target%/*}")
+      bwrap_args+=(--ro-bind-data "$resolver_fd" "$resolver_target")
+      ;;
+  esac
+fi
 
 # NixOS exposes system tools and privileged wrappers under /run. Preserve those
 # profiles without exposing the host's user runtime sockets or other /run state.
@@ -97,28 +187,100 @@ bwrap_args+=(
   --die-with-parent
 )
 
-# A regular-file mount needs an existing destination before Bubblewrap can bind it.
-exec {empty_fd}</dev/null
+bwrap_args+=(--dir /workspace/.config --dir /workspace/.cache --dir /workspace/.local)
+bwrap_args+=(--dir /workspace/.local/share --dir /workspace/.local/state)
 
-for entry in "${entries[@]}"; do
-  IFS=$'\t' read -r name source <<<"$entry"
-  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
-    || die "invalid workspace name: $name"
-  [[ -n "$source" ]] || die "empty path for workspace: $name"
-
-  source="$(realpath -e -- "$source")" \
-    || die "path does not exist for $name: $source"
-
+for i in "${!workspace_names[@]}"; do
+  name="${workspace_names[i]}"
+  source="${workspace_sources[i]}"
   destination="/workspace/$name"
-  if [[ -d "$source" ]]; then
+  if [[ "${workspace_types[i]}" == directory ]]; then
     bwrap_args+=(--dir "$destination")
-  elif [[ -f "$source" ]]; then
-    bwrap_args+=(--file "$empty_fd" "$destination")
-  else
-    die "path for $name is not a regular file or directory: $source"
   fi
   bwrap_args+=(--bind "$source" "$destination")
 done
+
+if [[ -f "$host_home/.gitconfig" ]]; then
+  bwrap_args+=(--ro-bind "$(realpath -e -- "$host_home/.gitconfig")" /workspace/.gitconfig)
+fi
+if [[ -d "$host_home/.nix-profile" ]]; then
+  nix_profile="$(realpath -e -- "$host_home/.nix-profile")"
+  bwrap_args+=(--dir /workspace/.nix-profile --ro-bind "$nix_profile" /workspace/.nix-profile)
+  bwrap_args+=(--setenv PATH "/workspace/.nix-profile/bin:${PATH-}")
+fi
+
+if [[ "$access_opencode" == true ]]; then
+  for relative in .config/opencode .local/share/opencode .cache/opencode .local/state/opencode; do
+    host_path="$host_home/$relative"
+    mkdir -p -- "$host_path"
+    host_path="$(realpath -e -- "$host_path")"
+    [[ -d "$host_path" ]] || die "OpenCode access path is not a directory: $host_path"
+    bwrap_args+=(--dir "/workspace/$relative" --bind "$host_path" "/workspace/$relative")
+  done
+else
+  bwrap_args+=(--dir /workspace/.config/opencode --dir /workspace/.local/share/opencode)
+  bwrap_args+=(--dir /workspace/.cache/opencode --dir /workspace/.local/state/opencode)
+fi
+
+if [[ "$access_ssh" == true ]]; then
+  [[ -n "${SSH_AUTH_SOCK-}" && -S "$SSH_AUTH_SOCK" ]] \
+    || die "access.ssh requires SSH_AUTH_SOCK to name a socket"
+  bwrap_args+=(--bind "$SSH_AUTH_SOCK" /run/ssh-agent.sock)
+  bwrap_args+=(--setenv SSH_AUTH_SOCK /run/ssh-agent.sock)
+
+  # OpenSSH rejects included system configuration files whose host-root owner
+  # is unmapped in the sandbox user namespace. Preserve the main system
+  # configuration while omitting Include directives that would fail that
+  # ownership check. User SSH configuration and private keys remain hidden.
+  if [[ -r /etc/ssh/ssh_config ]]; then
+    ssh_config_content=''
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      case "$trimmed" in
+        [Ii][Nn][Cc][Ll][Uu][Dd][Ee][[:space:]]*) continue ;;
+      esac
+      ssh_config_content+="$line"$'\n'
+    done </etc/ssh/ssh_config
+    exec {ssh_config_fd}<<<"$ssh_config_content"
+    bwrap_args+=(--tmpfs /etc/ssh)
+    bwrap_args+=(--ro-bind-data "$ssh_config_fd" /etc/ssh/ssh_config)
+    for known_hosts in /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2; do
+      if [[ -f "$known_hosts" ]]; then
+        bwrap_args+=(--ro-bind "$(realpath -e -- "$known_hosts")" "$known_hosts")
+      fi
+    done
+  fi
+else
+  bwrap_args+=(--unsetenv SSH_AUTH_SOCK)
+fi
+
+markdown_path() {
+  # Workspace names are syntax-restricted. Host paths are rendered in a
+  # shell-escaped form so control characters and Markdown punctuation cannot
+  # create additional instructions.
+  printf '%q' "$1"
+}
+
+agents_content="$({
+  printf '%s\n\n' '# Bubblebox Workspace'
+  printf '%s\n' "The top-level \`/workspace\` directory is ephemeral. Files created directly there do not persist after the sandbox exits."
+  printf '%s\n' 'Changes persist only when they modify one of the configured host-backed paths listed below.'
+  printf '%s\n\n' 'Use the sandbox paths inside Bubblebox; the host paths are informational.'
+  printf '%s\n\n' '## Persistent Paths'
+  for i in "${!workspace_names[@]}"; do
+    printf -- '- Sandbox: '
+    markdown_path "/workspace/${workspace_names[i]}"
+    printf '\n  Host source (shell-escaped): '
+    markdown_path "${workspace_sources[i]}"
+    printf '\n  Type: %s\n  Persistence: read-write host-backed mount\n' "${workspace_types[i]}"
+  done
+  printf '\n'
+  printf '%s\n' '## Project Instructions'
+  printf '%s\n' "Before working in a mounted project, read its nested \`AGENTS.md\` if one exists."
+  printf '%s\n' "Also read any more specific \`AGENTS.md\` files between the project root and each file being modified; those instructions apply within their directory scope."
+})"
+exec {agents_fd}<<<"$agents_content"
+bwrap_args+=(--ro-bind-data "$agents_fd" /workspace/AGENTS.md)
 
 if (($# == 0)); then
   command=("${SHELL:-/bin/sh}" -i)

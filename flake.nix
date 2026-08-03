@@ -29,5 +29,20 @@
           program = "${self.packages.${system}.default}/bin/box";
         };
       });
+
+      checks = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          box-syntax = pkgs.runCommand "box-syntax" {
+            nativeBuildInputs = [ pkgs.bash pkgs.shellcheck ];
+          } ''
+            bash -n ${./box}
+            bash -n ${./tests/test-box.sh}
+            shellcheck ${./tests/test-box.sh}
+            touch $out
+          '';
+        });
     };
 }
