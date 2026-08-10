@@ -228,12 +228,27 @@ if [[ "$access_ssh" == true ]]; then
   bwrap_args+=(--bind "$SSH_AUTH_SOCK" /run/ssh-agent.sock)
   bwrap_args+=(--setenv SSH_AUTH_SOCK /run/ssh-agent.sock)
 
+  # OpenSSH does not use XDG_CONFIG_HOME for its user known-hosts file. Since
+  # HOME points at the synthetic workspace, provide the conventional path
+  # there while keeping the host file read-only. The directory is also needed
+  # when the host has no known_hosts file yet.
+  bwrap_args+=(--dir /workspace/.ssh)
+  for known_hosts in "$host_home/.ssh/known_hosts" "$host_home/.ssh/known_hosts2"; do
+    if [[ -f "$known_hosts" ]]; then
+      known_hosts_relative="${known_hosts#"$host_home"/}"
+      bwrap_args+=(--ro-bind "$(realpath -e -- "$known_hosts")" "/workspace/$known_hosts_relative")
+    fi
+  done
+
   # OpenSSH rejects included system configuration files whose host-root owner
   # is unmapped in the sandbox user namespace. Preserve the main system
   # configuration while omitting Include directives that would fail that
   # ownership check. User SSH configuration and private keys remain hidden.
+  # OpenSSH expands its default ~/.ssh path from the passwd database rather
+  # than HOME. Use an absolute path so known-host updates stay in the box.
+  ssh_config_content='UserKnownHostsFile /workspace/.ssh/known_hosts
+'
   if [[ -r /etc/ssh/ssh_config ]]; then
-    ssh_config_content=''
     while IFS= read -r line || [[ -n "$line" ]]; do
       trimmed="${line#"${line%%[![:space:]]*}"}"
       case "$trimmed" in
@@ -241,15 +256,15 @@ if [[ "$access_ssh" == true ]]; then
       esac
       ssh_config_content+="$line"$'\n'
     done </etc/ssh/ssh_config
-    exec {ssh_config_fd}<<<"$ssh_config_content"
-    bwrap_args+=(--tmpfs /etc/ssh)
-    bwrap_args+=(--ro-bind-data "$ssh_config_fd" /etc/ssh/ssh_config)
-    for known_hosts in /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2; do
-      if [[ -f "$known_hosts" ]]; then
-        bwrap_args+=(--ro-bind "$(realpath -e -- "$known_hosts")" "$known_hosts")
-      fi
-    done
   fi
+  exec {ssh_config_fd}<<<"$ssh_config_content"
+  bwrap_args+=(--tmpfs /etc/ssh)
+  bwrap_args+=(--ro-bind-data "$ssh_config_fd" /etc/ssh/ssh_config)
+  for known_hosts in /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2; do
+    if [[ -f "$known_hosts" ]]; then
+      bwrap_args+=(--ro-bind "$(realpath -e -- "$known_hosts")" "$known_hosts")
+    fi
+  done
 else
   bwrap_args+=(--unsetenv SSH_AUTH_SOCK)
 fi

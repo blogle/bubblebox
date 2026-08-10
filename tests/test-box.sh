@@ -9,10 +9,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/dir with spaces"
 mkdir -p "$tmp/home/.nix-profile/bin"
+mkdir -p "$tmp/home/.ssh"
 printf '# Nested project instructions\n' > "$tmp/dir with spaces/AGENTS.md"
 printf 'fixture\n' > "$tmp/file with spaces"
 printf 'tab fixture\n' > "$tmp/file$(printf '\t')name"
 printf '[user]\n\tname = Bubble Box\n' > "$tmp/home/.gitconfig"
+printf '# known hosts fixture\n' > "$tmp/home/.ssh/known_hosts"
 cat > "$tmp/home/.nix-profile/bin/profile-tool" <<'EOF'
 #!/bin/sh
 printf 'profile fixture\n'
@@ -101,6 +103,9 @@ if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null && command -
     "$box" -f "$tmp/ssh.yml" -- sh -eu -c '
       test "$SSH_AUTH_SOCK" = /run/ssh-agent.sock
       test -S "$SSH_AUTH_SOCK"
+      test -r /workspace/.ssh/known_hosts
+      test "$(cat /workspace/.ssh/known_hosts)" = "# known hosts fixture"
+      test "$(ssh -G example.invalid | awk '\''$1 == "userknownhostsfile" { print $2; exit }'\'')" = /workspace/.ssh/known_hosts
       status=0
       ssh-add -l >/dev/null 2>&1 || status=$?
       test "$status" -eq 1
